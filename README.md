@@ -1,5 +1,7 @@
 # Shadow the Hedgehog (Xbox, 2005) — recompilation attempt
 
+[![Support me on Ko-fi](https://img.shields.io/badge/Ko--fi-Support%20me-FF5E5B?logo=ko-fi&logoColor=white)](https://ko-fi.com/defenceplox)
+
 > A fork of **[xboxrecomp](https://github.com/sp00nznet/xboxrecomp)** — sp00nz's
 > static-recompilation toolkit for original Xbox games (MIT, © 2026 sp00nz) —
 > carrying an attempt to recompile **Shadow the Hedgehog (Xbox, 2005)**.
