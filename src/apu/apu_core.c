@@ -1129,14 +1129,34 @@ static void *mcpx_apu_frame_thread(void *arg)
 
     while (!qatomic_read(&d->exiting)) {
         if (d->pause_requested && !g_test_tone.active && !g_mixer_active_count) {
-            d->is_idle = true;
-            if (xa2_is_active())
-                xa2_expect_drain();     /* a pause, not an underrun */
-            hs_rebase();
+            /* Note the idle state but keep iterating.
+             *
+             * This used to sleep on a condvar until the title started the
+             * front end. That is wrong for the voice processor: XCNTMODE gates
+             * the frame counter, not the voices, and a title that clears
+             * XCNTMODE and then kicks a voice -- write 2, spin until bit 1
+             * clears -- never sees the kick acknowledged, because nothing ran
+             * the VP. Shadow the Hedgehog's DirectSound submit does exactly
+             * that and never leaves audio initialisation.
+             *
+             * The doorbell ack has the same problem for the same reason (the
+             * GP DSP runs whatever the front end is doing), so it is polled
+             * here as well as in the main body. */
+            if (!d->is_idle) {
+                d->is_idle = true;
+                if (xa2_is_active())
+                    xa2_expect_drain();     /* a pause, not an underrun */
+                hs_rebase();
+            }
+            mcpx_apu_dsp_ack_poll(d);
+            {
+                float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME];
+                memset(mixbins, 0, sizeof(mixbins));
+                mcpx_apu_vp_frame(d, mixbins);
+            }
             qemu_cond_signal(&d->idle_cond);
-            qemu_cond_wait(&d->cond, &d->lock);
+        } else {
             d->is_idle = false;
-            continue;
         }
 
         /* Always run the audio output loop — the software mixer and test tone
@@ -1186,7 +1206,16 @@ static void *mcpx_apu_frame_thread(void *arg)
              * delivered below; the wait is after it. */
             apu_irq_stats.fe_trapped_frames++;
         } else {
-            /* Lightweight: just monitor frame (test tone + software mixer) */
+            /* Lightweight: just monitor frame (test tone + software mixer).
+             *
+             * The voice processor still runs: XCNTMODE gates the frame
+             * counter, not the voices, and a voice kick written while the
+             * front end is idle has to be consumed or the title spins. */
+            {
+                float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME];
+                memset(mixbins, 0, sizeof(mixbins));
+                mcpx_apu_vp_frame(d, mixbins);
+            }
             mcpx_apu_monitor_frame(d);
             d->ep_frame_div++;
         }

@@ -140,11 +140,24 @@ static uint32_t *dsp_ack_auto_slot(MCPXAPUState *d)
 {
     uint32_t sge = qatomic_read(&d->regs[NV_PAPU_GPSADDR]), page;
 
-    if (!sge || s_gp_in_reset)
+    if (!sge || s_gp_in_reset) {
+        static int said_nosge, said_reset;
+        if (!sge && said_nosge++ < 2)
+            fprintf(stderr, "[APU] doorbell: GPSADDR unset (sge=0)%s\n",
+                    s_gp_in_reset ? ", GP held in reset" : "");
+        else if (sge && s_gp_in_reset && said_reset++ < 2)
+            fprintf(stderr, "[APU] doorbell: GP held in reset (GPSADDR=%08X)\n",
+                    sge);
         return NULL;
+    }
     page = *(const uint32_t *)mcpx_apu_phys(sge);
-    if (!page || (page & 0xFFF))
+    if (!page || (page & 0xFFF)) {
+        static int said_page;
+        if (said_page++ < 3)
+            fprintf(stderr, "[APU] doorbell: SGE[0] at %08X reads %08X "
+                            "(not a page)\n", sge, page);
         return NULL;                       /* table not filled in yet */
+    }
     if (page != s_dsp_ack_auto_page) {
         s_dsp_ack_auto_page = page;
         fprintf(stderr, "[APU] DSP doorbell: GP scratch SGE table 0x%08X maps"

@@ -37,3 +37,23 @@ bin/
 *.obj
 *.exe
 tools/split/output/
+
+# --- Shadow the Hedgehog (this fork) ---------------------------------------
+# Machine-translated game code. It is a derivative of SEGA's copyrighted
+# binary, so it is never committed: regenerate it locally from your own XBE.
+shadow_game/src/recomp/gen/
+shadow_game/src/recomp/gen_textonly_backup/
+
+# Build output
+shadow_game/build/
+shadow_game/build_win/
+shadow_game/build_objs/
+shadow_game/build_objects.sh
+*.exe
+*.dll
+*.obj
+*.pdb
+
+# Probe output
+frames/
+*.log

@@ -1,5 +1,49 @@
 # Ghidra Headless Naming Pipeline (Xbox XBE)
 
+> **Ghidra 12.x / Linux (2026-11-07).** Two things broke in this toolkit since it
+> was written, both fixed here:
+>
+> 1. **Jython is gone.** `ExportXbeNames.py` is a Jython (Python 2) script and
+>    Ghidra 12.x refuses to load it — `JythonStubScriptProvider: Jython script
+>    failed … install the Jython Ghidra Extension, or port your script to
+>    PyGhidra or Java`. It is ported to **`ghidra_scripts/ExportXbeNames.java`**,
+>    which writes the same three files with the same JSON shapes, so
+>    `merge_names.py` and the recompiler's `functions.json` reader are unchanged.
+> 2. **The runner is Windows-shaped.** `run_ghidra.sh` hardcodes
+>    `analyzeHeadless.bat` and `/c/tools/ghidra`. Use
+>    **`run_ghidra_linux.sh`** on Linux.
+>
+> Measured on this project: Ghidra **12.2** wants JDK **21+** and *rejects 21* as
+> unsupported — **JDK 25** works. A portable install (JDK + Ghidra unpacked under
+> `/mnt/docker/tools`, no root needed) is enough:
+>
+> ```bash
+> export JAVA_HOME=/mnt/docker/tools/jdk-25.0.5+8
+> export GHIDRA_HOME=/mnt/docker/tools/ghidra/ghidra_12.2_PUBLIC
+> IMAGE=/mnt/docker/sites/shadow/IMAGE/shadow.img \
+>   tools/ghidra_naming/run_ghidra_linux.sh
+> ```
+>
+> **Seed as well as configure.** `SeedFunctions.java` (also a Jython port, and it
+> applies the naming analyzers too, because `analyzeHeadless` takes one
+> `-preScript`) seeds Ghidra with the recompiler's own 39,345 function starts
+> before analysis. Measured here: unseeded, Ghidra discovers 17,789 functions and
+> FidDb yields 509 names; seeded it creates **39,264** functions (31,183
+> disassembled), which is the whole point — FidDb only matches bodies it has
+> bounded at the right addresses.
+>
+> Full Linux invocation with seeding:
+>
+> ```bash
+> "$GHIDRA_HOME/support/analyzeHeadless" /tmp/ghidra_proj shadow \
+>   -import IMAGE/shadow.img -loader BinaryLoader -loader-baseAddr 0x10000 \
+>   -processor "x86:LE:32:default" -cspec windows -overwrite \
+>   -scriptPath tools/ghidra_naming/ghidra_scripts \
+>   -preScript SeedFunctions.java "$PWD/tools/disasm/output/functions.json" \
+>   -postScript ExportXbeNames.java /tmp/ghidra_export nodecompile
+> ```
+
+
 Recovers real function names / symbols / decompiled C from the Xbox XBE Xbox
 XBE using **Ghidra headless**, then turns them into a `{address: name}`
 map the static recompiler can consume to replace `sub_XXXXXXXX` names with

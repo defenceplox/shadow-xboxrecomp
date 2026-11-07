@@ -1,0 +1,39 @@
+Shadow the Hedgehog - recompiled (xboxrecomp toolkit)
+
+WHAT TO RUN
+
+    run_logo.bat        full disc tree + codec reported ready
+                        -> "PRESENTED BY SEGA" logo, or the loading screen
+                           (a race: ~2 runs in 3 land on the loading screen)
+    run_loading.bat     the OLD behaviour: truncated tree, loading screen loop
+    shadow_recomp.exe   plain - and this CRASHES. See below.
+
+WHY A PLAIN RUN SHOWS NOTHING (expected, not a regression)
+
+    The title calls DirectSoundCreate, gets DSERR_NODRIVER because the AC'97
+    codec poll never comes up, does NOT check the result, and then calls
+    IDirectSound8 methods on the resulting NULL object. The process dies on a
+    wild-pointer fault before any window is created - you get a Wine
+    "Program Error" dialog and nothing else.
+
+    That happens because the disc tree is now COMPLETE (3,510 files). The old
+    tree held 1,509 files and had no sound/ directory, so the audio stage
+    aborted early and the title fell through to the loading screen instead.
+    run_loading.bat reproduces that old behaviour; run_logo.bat sets
+    RECOMP_AC97_READY=1 so the create succeeds and the title actually renders.
+
+PATHS
+
+    game_files\default.xbe      the Xbox executable  (beside the exe)
+    ..\WORKSPACE\files          extracted disc tree (3,510 files, 2.53 GB)
+    ..\WORKSPACE\files_trunc    the old truncated tree (1,509 files), A/B only
+
+    Override the disc tree with RECOMP_DATA_DIR=<path to a files directory>.
+    Optional: shadow_recomp.exe <path-to-some.xbe> overrides the XBE.
+
+STATUS (2026-11-07, XBR_ATTEMPT.md passes 23-26)
+
+    Boots, loads data, renders. Reaches the boot logo or the loading screen and
+    stops there. Known remaining gates, in order: the audio device model (or a
+    silent stub), then gamepad input (OHCI enumeration is incomplete).
+

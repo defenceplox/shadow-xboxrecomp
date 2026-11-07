@@ -589,6 +589,20 @@ static const struct { uint32_t offset; uint32_t idle_mask; } NV2A_IDLE[] = {
 static void *g_ac97_page = NULL;      /* host address of the trapped page */
 static void *g_ac97_veh  = NULL;
 static RECOMP_TLS int s_ac97_stepping = 0;
+static RECOMP_TLS uintptr_t s_ac97_fault = 0;
+
+/* RECOMP_AC97_LOG: print every trapped bus-master write (offset, value, pc).
+ * This is how the register script a title issues is read out without guessing:
+ * it is the spec an AC'97/DSP model has to satisfy. Not a behaviour change --
+ * the reset bits are still masked afterwards. */
+static int s_ac97_log = -1;
+
+static int ac97_log_on(void)
+{
+    if (s_ac97_log < 0)
+        s_ac97_log = getenv("RECOMP_AC97_LOG") != NULL;
+    return s_ac97_log;
+}
 
 static void ac97_clear_reset_bits(void)
 {
@@ -626,6 +640,22 @@ static LONG CALLBACK ac97_write_veh(PEXCEPTION_POINTERS ep)
      * mid-step. */
     if (code == EXCEPTION_SINGLE_STEP && s_ac97_stepping) {
         s_ac97_stepping = 0;
+        if (ac97_log_on()) {
+            /* The write has landed by the time the single-step is delivered,
+             * so the value is in memory. Report the 32-bit word the byte sits
+             * in, plus whether the offset is a channel control byte (+0x0B of
+             * every 0x10-byte channel block). */
+            size_t off = (size_t)(s_ac97_fault - (uintptr_t)g_ac97_page);
+            size_t word = off & ~(size_t)3;
+            uint32_t v = 0;
+            int ctl = (off >= 0x0B) && (((off - 0x0B) % 0x10) == 0);
+            if (word + 4 <= AC97_TRAP_BYTES)
+                v = *(volatile uint32_t *)((char *)g_ac97_page + word);
+            fprintf(stderr, "  [AC97] w off 0x%03zX word 0x%08X%s pc=0x%08llX\n",
+                    off, v, ctl ? "  <channel ctl (RR)" : "",
+                    (unsigned long long)ep->ContextRecord->Rip);
+            fflush(stderr);
+        }
         ac97_clear_reset_bits();
         VirtualProtect(g_ac97_page, AC97_TRAP_BYTES, PAGE_READONLY, &old);
         ep->ContextRecord->EFlags &= ~0x100u;   /* clear TF */
@@ -638,6 +668,7 @@ static LONG CALLBACK ac97_write_veh(PEXCEPTION_POINTERS ep)
 
         if (fault >= (uintptr_t)g_ac97_page
                 && fault < (uintptr_t)g_ac97_page + AC97_TRAP_BYTES) {
+            s_ac97_fault = fault;
             if (!VirtualProtect(g_ac97_page, AC97_TRAP_BYTES,
                                 PAGE_READWRITE, &old))
                 return EXCEPTION_CONTINUE_SEARCH;
@@ -2400,6 +2431,24 @@ static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
                     g_icall_trace[(g_icall_trace_idx + k) & 15]);
         fprintf(stderr, "\n");
     }
+    /* Guest stack walk: words on the parked thread's stack that land in the
+     * .text range are return addresses, so this names the call chain the thread
+     * is stuck in -- which a pure CPU spin otherwise hides. */
+    {
+        uint32_t k;
+        fprintf(stderr, "  guest stack@%08X (code-range words = return addr):\n   ",
+                esp);
+        for (k = 0; k < 24u; k++) {
+            uint32_t a = esp + k * 4u, v;
+            if (!peek_readable(a))
+                break;
+            v = *(const uint32_t *)(mem + a);
+            if (v >= 0x00010000u && v < 0x006A0000u)
+                fprintf(stderr, " +%02X:%08X", k * 4u, v);
+        }
+        fprintf(stderr, "\n");
+        fflush(stderr);
+    }
     /* Guest globals worth seeing at the moment of the hang.
      *
      * RECOMP_PEEK is otherwise only sampled by the pushbuffer reporter, which
@@ -3109,6 +3158,15 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                                     ? data_end - data_start : 0;
                 uint32_t total      = ((init_size + zero_fill + 0xF) & ~0xFu) + 4;
 
+                /* The per-thread data area must cover every TLS variable the
+                 * title declared. This was hardcoded to 64 bytes, but Shadow's
+                 * TLS directory declares SizeOfZeroFill = 0x90 (144), so any
+                 * variable past offset 64 read and wrote outside its block --
+                 * silently, since the heap page is there. Size it from the
+                 * directory instead of guessing. */
+                if (init_size + zero_fill > 64)
+                    g_tls_thread_size = init_size + zero_fill;
+
                 memset(XBOX_VA(FAKE_TLS_BLOCK_VA), 0, total);
                 memset(XBOX_VA(FAKE_TLS_THREAD_VA), 0, 64);
                 if (init_size)
@@ -3117,6 +3175,25 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
 
                 MEM32_INIT(FAKE_TLS_BLOCK_VA, FAKE_TLS_THREAD_VA);
                 MEM32_INIT(XBOX_FS_BASE + 0x04, FAKE_TLS_BLOCK_VA + total);
+                /* tls[2] is AddressOfIndex: the global the MSVC TLS accessors read
+                 * to find their slot (`mov eax,[_tls_index]; mov ecx,[fs:4];
+                 * mov eax,[ecx+eax*4]`). Nothing else assigns it on this path --
+                 * on a real box the loader does -- so it stayed 0 and every
+                 * __declspec(thread) variable in the title aliased slot 0, whose
+                 * data is a zero block. That reads as 0 forever, which is why
+                 * NowLoadingTask's driver always saw state 0 and never advanced
+                 * the load progress. Measured: [0x5599A8] was 0 and the accessor
+                 * returned 0 every call.
+                 *
+                 * The index this block uses is negative (Xbox scheme): the array
+                 * is at fs:[4] = block + total, and index = -(total/4) resolves
+                 * back to `block`. */
+                if (tls[2]) {
+                    int32_t idx = -(int32_t)(total / 4);
+                    MEM32_INIT(tls[2], (uint32_t)idx);
+                    fprintf(stderr, "  TLS: AddressOfIndex 0x%08X = %d\n",
+                            tls[2], idx);
+                }
 
                 g_tls_template_va = FAKE_TLS_BLOCK_VA;
                 g_tls_total       = total;

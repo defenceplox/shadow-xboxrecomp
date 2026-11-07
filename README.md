@@ -1,3 +1,84 @@
+# Shadow the Hedgehog (Xbox, 2005) — recompilation attempt
+
+> A fork of **[xboxrecomp](https://github.com/sp00nznet/xboxrecomp)** — sp00nz's
+> static-recompilation toolkit for original Xbox games (MIT, © 2026 sp00nz) —
+> carrying an attempt to recompile **Shadow the Hedgehog (Xbox, 2005)**.
+>
+> The toolkit's own documentation follows unchanged from
+> [**xboxrecomp**](#xboxrecomp) below. Everything above that heading is specific
+> to this fork.
+
+## Status: it does not boot
+
+It compiles, runs, loads the disc, and renders. It does **not** get past the
+loading screen. Being precise about where it stops, because that is the only
+interesting part:
+
+- ~39,400 functions are lifted from the XBE and execute natively.
+- The full disc tree is read (3,510 files) and the SEGA logo / loading screen draws
+  at ~26 fps.
+- **The engine's logic threads park about 176 ms into boot.** Measured: the
+  engine's own clock function is called exactly 6 times in a 25-second run, all
+  inside the first ~176 ms, and never again — while the renderer keeps drawing
+  (5,000+ frames). The `NowLoadingTask` gets 4 ticks in that window and none
+  after, so its per-frame body never runs and its progress counter never leaves 0.
+
+The full investigation is in **[`XBR_ATTEMPT.md`](XBR_ATTEMPT.md)** — 30 passes,
+every claim measured, wrong turns kept rather than deleted.
+
+## What this fork adds
+
+**Runtime fixes** (hand-written, in the shared kernel — these are title-agnostic,
+not Shadow-specific):
+
+| File | Fix |
+|---|---|
+| `src/kernel/xbox_memory_layout.c` | **Guest TLS was never initialised.** The XBE TLS directory's `AddressOfIndex` was ignored, so every `__declspec(thread)` variable aliased slot 0 and read 0 forever; the per-thread area was also hardcoded to 64 bytes when the title declares 144. |
+| `src/kernel/kernel_bridge.c` | `ke_wait_result` — wait outcomes, including timeouts, reported through the audit layer. |
+| `tools/xdvdfs.py` | **`read_dir()` stopped at the first `0xFF` padding byte**, truncating every multi-sector directory to its first sector: 1,509 files instead of 3,510. Cross-verified against the independent reader in `tools/xiso/xdvdfs.py`. |
+
+**Tooling:**
+
+- `tools/ghidra_naming/` — Ghidra 12.2 removed Jython, which killed both shipped
+  scripts. `ExportXbeNames.java`, `SeedFunctions.java` (39k function starts) and
+  `SetAnalysisOptionsFast.java` are the Java ports, plus `DecompileAt.java` for
+  targeted decompilation of individual functions. The README documents the JDK 25
+  requirement and the fact that `-preScript` accepts only one script.
+- `shadow_game/src/xbr_audit.c` — a gated audit harness (silent unless
+  `RECOMP_XBR_AUDIT` is set) with segment counters, value/pair histograms, object
+  and call-site probes, and live dumps of the task manager, loading task and
+  pending CSD path.
+
+**Research notes:** `XBR_ATTEMPT.md` (the full log), `PROGRESS.md`,
+`ADVICE_REQUEST.md`, `RUN_ME_FIRST.txt`.
+
+## What is deliberately not here
+
+**No game data and no generated game code.** There is no disc image, no `default.xbe`,
+and no `shadow_game/src/recomp/gen/` — that directory is ~104 MB of machine
+translation of SEGA's copyrighted binary and is excluded by `.gitignore`. It is
+regenerated locally from your own legally obtained copy of the game; see
+`XBR_ATTEMPT.md` for the pipeline. This mirrors how other recomp ports publish
+runtime and tools while shipping no title content.
+
+You need your own copy of Shadow the Hedgehog for Xbox to build or run anything
+here. Nothing in this repository is affiliated with or endorsed by SEGA.
+
+## Credits
+
+- **[sp00nznet/xboxrecomp](https://github.com/sp00nznet/xboxrecomp)** — the
+  toolkit, the runtime and everything below `# xboxrecomp`. This fork is a thin
+  layer on top of that work.
+- **[BigSnek9/ShadowRecomp](https://github.com/BigSnek9/ShadowRecomp)** — a
+  working GameCube port of the same game. None of its code is usable in an x86
+  Xbox build, but its `overrides.txt` naming `hle_FramePace` is what pointed this
+  investigation at the frame pacer described in Pass 30.
+
+Licensed MIT, as upstream.
+
+---
+
+
 # xboxrecomp
 
 ```

@@ -200,6 +200,48 @@ static uint64_t ptimer_get_clock(NV2AState *d)
                     d->ptimer.numerator);
 }
 
+/* Diagnostic: Shadow's fade/loading timers may be reading PTIMER, which reads
+ * back as a constant 0 whenever the guest has not programmed NUMERATOR. Log the
+ * first reads of each register and a running count so the trace says whether the
+ * guest uses this clock at all, and whether it is frozen when it does. */
+static void ptimer_trace(uint32_t addr, uint64_t val)
+{
+    static int enabled = -1;
+    static uint32_t raddr[8];
+    static unsigned long rcount[8];
+    static int nseen;
+    static unsigned long total;
+    int i;
+
+    if (enabled < 0) {
+        const char *e = getenv("RECOMP_PTIMER_TRACE");
+        enabled = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    if (!enabled) return;
+
+    total++;
+    for (i = 0; i < nseen; i++) {
+        if (raddr[i] == addr) { rcount[i]++; break; }
+    }
+    if (i == nseen) {
+        if (nseen < 8) {
+            raddr[nseen] = addr;
+            rcount[nseen] = 1;
+            nseen++;
+            fprintf(stderr, "[PTIMER] first read 0x%08X -> 0x%llx\n",
+                    addr, (unsigned long long)val);
+        }
+    }
+    if ((total % 20000) == 0) {
+        fprintf(stderr, "[PTIMER] %lu reads:", total);
+        for (i = 0; i < nseen; i++) {
+            fprintf(stderr, " 0x%08X x%lu", raddr[i], rcount[i]);
+        }
+        fprintf(stderr, "\n");
+        fflush(stderr);
+    }
+}
+
 uint64_t ptimer_read(void *opaque, hwaddr addr, unsigned int size)
 {
     NV2AState *d = (NV2AState *)opaque;
@@ -229,6 +271,7 @@ uint64_t ptimer_read(void *opaque, hwaddr addr, unsigned int size)
     }
 
     nv2a_reg_log_read(NV_PTIMER, addr, size, r);
+    ptimer_trace((uint32_t)addr, r);
     return r;
 }
 

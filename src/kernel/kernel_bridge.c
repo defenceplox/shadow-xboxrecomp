@@ -792,12 +792,50 @@ static HANDLE bridge_spawn_thread(recomp_func_t fn, uint32_t ctx1,
  * an extra reference until the handle token owns one, so a worker that ends
  * at once cannot free it underneath us. The KE shadow gets its own duplicate
  * of the host thread handle, which is what KeWaitForSingleObject waits on. */
+/* Guest thread stacks, recorded at spawn so a host dump can scan each one.
+ * Only the top window is scanned: a parked thread keeps its live frames near
+ * its stack top, and scanning 512 KB per thread would mostly find stale data. */
+#define XBOX_GUEST_STACK_MAX 16
+static uint32_t g_guest_stack_top[XBOX_GUEST_STACK_MAX];
+static int g_guest_stack_count;
+
+void xbox_DumpGuestStacks(void)
+{
+    int t, i;
+
+    fprintf(stderr, "[STACKS] %d guest thread stack(s)\n", g_guest_stack_count);
+    for (t = 0; t < g_guest_stack_count; t++) {
+        uint32_t top = g_guest_stack_top[t];
+        const uint32_t *p;
+        int shown = 0;
+
+        if (!top || top < 0x1000u)
+            continue;
+        /* The live frames of a blocked thread sit just below its stack top. */
+        p = (const uint32_t *)((uintptr_t)g_xbox_mem_offset + (top & ~3u) - 0x1000u);
+        fprintf(stderr, "[STACKS] thread %d top=0x%08X frames:\n", t, top);
+        for (i = 0; i < 1024 && shown < 10; i++) {
+            uint32_t v = p[i];
+            if (v > 0x00011000u && v < 0x0069CBA0u) {
+                fprintf(stderr, "[STACKS]   0x%08X\n", v);
+                shown++;
+            }
+        }
+        if (!shown)
+            fprintf(stderr, "[STACKS]   (no code addresses in the top 4 KB)\n");
+    }
+    fflush(stderr);
+}
+
 static HANDLE bridge_spawn_guest_thread(recomp_func_t fn, uint32_t ctx1,
                                         uint32_t ctx2, uint32_t stack_top,
                                         uint32_t handle_va, uint32_t tls_size)
 {
     uint32_t obj = thobj_alloc();
     HANDLE th, shadow = NULL;
+
+    if (g_guest_stack_count < XBOX_GUEST_STACK_MAX)
+        g_guest_stack_top[g_guest_stack_count++] = stack_top;
 
     thobj_ref(obj);
     th = bridge_spawn_thread(fn, ctx1, ctx2, stack_top, obj, tls_size);
@@ -2034,7 +2072,94 @@ static void bridge_KeSetEvent(void)
         g_eax = 0;
 }
 
+/* Signal an event the title built itself, by guest VA, from the host.
+ *
+ * The host main uses this to acknowledge the D3D "GPU finished" event: the
+ * title blocks in KeWaitForSingleObject on it, and writing its SignalState
+ * word is not enough because a wait that is already blocked sits on the host
+ * event, not on guest memory. Returns 1 when the address was one of the
+ * title's events. */
+int xbox_GuestEventSignal(uint32_t guest_va)
+{
+    int type;
+    HANDLE ge = ke_guest_event(guest_va, &type);
+
+    if (!ge)
+        return 0;
+    BRIDGE_MEM32(guest_va + 4) = 1;
+    SetEvent(ge);
+    return 1;
+}
+
 /* ── KeWaitForSingleObject (ordinal 159) ─────────────────── */
+static int g_wait_trace = -1;
+
+static void ke_wait_trace(uint32_t object, uint32_t h, int kind,
+                          uint32_t timeout_ptr, uint32_t ret)
+{
+    static int n;
+
+    if (g_wait_trace < 0)
+        g_wait_trace = getenv("RECOMP_WAIT_TRACE") ? 40 : 0;
+    if (g_wait_trace-- > 0) {
+        fprintf(stderr, "  [WAIT] obj=0x%08X handle=0x%08X kind=%d timeout=0x%08X"
+                        " caller=0x%08X\n",
+                object, h, kind, timeout_ptr, ret);
+
+        /* The first few waits also dump the guest call chain: `ret` above is
+         * the return address of the indirect call inside the wait helper, so
+         * it names the helper, not its caller. Scanning the guest stack for
+         * code addresses recovers who is actually looping. */
+        if (n++ < 3 && g_esp) {
+            const uint32_t *sp =
+                (const uint32_t *)((uintptr_t)g_xbox_mem_offset + g_esp);
+            int shown = 0, i;
+            fprintf(stderr, "  [WAIT]   guest stack:\n");
+            for (i = 0; i < 256 && shown < 12; i++) {
+                uint32_t v;
+                v = sp[i];
+                if (v > 0x00011000u && v < 0x0069CBA0u) {
+                    fprintf(stderr, "  [WAIT]     [esp+%-4d] 0x%08X\n", i * 4, v);
+                    shown++;
+                }
+            }
+        }
+    }
+}
+
+/* Report a wait's OUTCOME. ke_wait_trace above says what was waited on; this
+ * says how it ended, and timeouts are the interesting case: a fallback path is
+ * usually selected by a wait that expired rather than by an explicit status
+ * check, so every WAIT_TIMEOUT is printed even after the pre-wait trace is
+ * capped. RECOMP_WAIT_TRACE turns it on (same switch, no new knob).
+ *
+ * Guest timeouts are LARGE_INTEGERs in 100 ns ticks: negative = relative.
+ */
+static int g_wait_tmo_shown;
+
+static void ke_wait_result(uint32_t object, uint32_t ret, uint32_t timeout_ptr,
+                           uint32_t result, uint32_t ms)
+{
+    if (result != 0x102u)          /* WAIT_TIMEOUT */
+        return;
+    if (!getenv("RECOMP_WAIT_TRACE") || g_wait_tmo_shown > 400)
+        return;
+    g_wait_tmo_shown++;
+    if (timeout_ptr) {
+        uint32_t lo = BRIDGE_MEM32(timeout_ptr);
+        uint32_t hi = BRIDGE_MEM32(timeout_ptr + 4);
+        int64_t  t  = (int64_t)(((uint64_t)hi << 32) | lo);
+        long long rel = t < 0 ? (long long)(-t / 10000) : -1;
+        fprintf(stderr, "  [WAIT] TIMEOUT obj=0x%08X caller=0x%08X"
+                        " req=%lldms elapsed=%ums\n",
+                object, ret, rel, (unsigned)ms);
+    } else {
+        fprintf(stderr, "  [WAIT] TIMEOUT obj=0x%08X caller=0x%08X"
+                        " req=INFINITE elapsed=%ums\n", object, ret, (unsigned)ms);
+    }
+    fflush(stderr);
+}
+
 static void bridge_KeWaitForSingleObject(void)
 {
     uint32_t object = STACK_ARG(0);
@@ -2042,6 +2167,7 @@ static void bridge_KeWaitForSingleObject(void)
     uint32_t wait_mode = STACK_ARG(2);
     uint32_t alertable = STACK_ARG(3);
     uint32_t timeout_ptr = STACK_ARG(4);
+    uint32_t ret = (uint32_t)(uintptr_t)g_xbox_kernel_caller;
     HANDLE h;
 
     {   /* An event the title built itself (see ke_guest_event). Its
@@ -2050,9 +2176,14 @@ static void bridge_KeWaitForSingleObject(void)
         int type;
         HANDLE ge = ke_guest_event_prepare(object, &type);
         if (ge) {
+            uint32_t t0;
+            ke_wait_trace(object, (uint32_t)(uintptr_t)ge, type, timeout_ptr, ret);
+            t0 = (uint32_t)GetTickCount();
             g_eax = (uint32_t)xbox_KeWaitForSingleObject(
                 ge, wait_reason, wait_mode,
                 (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
+            ke_wait_result(object, ret, timeout_ptr, g_eax,
+                           (uint32_t)GetTickCount() - t0);
             if (g_eax == 0 && type == 1)               /* synchronization: consumed */
                 BRIDGE_MEM32(object + 4) = 0;
             return;
@@ -2065,9 +2196,15 @@ static void bridge_KeWaitForSingleObject(void)
     if (!h)
         h = XBOX_TO_NATIVE(object);
 
-    g_eax = (uint32_t)xbox_KeWaitForSingleObject(
-        h, wait_reason, wait_mode,
-        (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
+    ke_wait_trace(object, (uint32_t)(uintptr_t)h, -1, timeout_ptr, ret);
+    {
+        uint32_t t0 = (uint32_t)GetTickCount();
+        g_eax = (uint32_t)xbox_KeWaitForSingleObject(
+            h, wait_reason, wait_mode,
+            (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
+        ke_wait_result(object, ret, timeout_ptr, g_eax,
+                       (uint32_t)GetTickCount() - t0);
+    }
 }
 
 /* ── NtWaitForSingleObject (ordinal 233) ─────────────────── */
@@ -2079,14 +2216,21 @@ static void bridge_KeWaitForSingleObject(void)
  */
 static void bridge_NtWaitForSingleObject(void)
 {
-    HANDLE   handle      = bridge_resolve_handle(STACK_ARG(0));
+    uint32_t obj_va      = STACK_ARG(0);
+    HANDLE   handle      = bridge_resolve_handle(obj_va);
     uint32_t alertable   = STACK_ARG(1);
     uint32_t timeout_ptr = STACK_ARG(2);
 
     if (bridge_run_io_apcs(alertable, 1))
         return;
-    g_eax = (uint32_t)xbox_NtWaitForSingleObject(
-        handle, (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
+    {
+        uint32_t t0 = (uint32_t)GetTickCount();
+        uint32_t caller = (uint32_t)(uintptr_t)g_xbox_kernel_caller;
+        g_eax = (uint32_t)xbox_NtWaitForSingleObject(
+            handle, (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
+        ke_wait_result(obj_va, caller, timeout_ptr, g_eax,
+                       (uint32_t)GetTickCount() - t0);
+    }
 }
 
 /* ── NtClearEvent (ordinal 186) ──────────────────────────── */
@@ -4255,6 +4399,33 @@ static NTSTATUS bridge_create_file_impl(
             fprintf(stderr, "  [FILE] %s (disp %u opts 0x%X from 0x%08X) -> 0x%08X\n",
                     gpath, (unsigned)disposition, (unsigned)options,
                     g_xbox_kernel_caller, status);
+
+        /* RECOMP_FILE_TRACE: name the *game* code that is loading. The
+         * "from 0x…" above is the ordinal thunk's return address, which says
+         * nothing about the caller; scanning the guest stack for code
+         * addresses gives the loader's own frames. Capped so a title that
+         * opens thousands of files does not flood the log. */
+        {
+            static int s_file_trace = -1;
+            static int s_file_shown;
+            if (s_file_trace < 0)
+                s_file_trace = getenv("RECOMP_FILE_TRACE") ? 64 : 0;
+            if (s_file_trace-- > 0 && g_esp) {
+                const uint32_t *sp =
+                    (const uint32_t *)((uintptr_t)g_xbox_mem_offset + g_esp);
+                int shown = 0, i;
+                fprintf(stderr, "  [FILE]   caller chain:\n");
+                for (i = 0; i < 256 && shown < 8; i++) {
+                    uint32_t v = sp[i];
+                    if (v > 0x00011000u && v < 0x0069CBA0u) {
+                        fprintf(stderr, "  [FILE]     [esp+%-4d] 0x%08X\n",
+                                i * 4, v);
+                        shown++;
+                    }
+                }
+                (void)s_file_shown;
+            }
+        }
     }
     fflush(stderr);
     return st;
